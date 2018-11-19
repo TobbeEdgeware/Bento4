@@ -22,6 +22,7 @@ import urllib2
 import urlparse
 import shutil
 import itertools
+import time
 import json
 import sys
 from xml.etree import ElementTree
@@ -45,11 +46,14 @@ def Bento4Command(name, *args, **kwargs):
     cmd += args
     #print cmd
     try:
-        return check_output(cmd) 
+        return check_output(cmd)
     except CalledProcessError, e:
         #print e
         raise Exception("binary tool failed with error %d" % e.returncode)
-    
+
+def IsAbsoluteURL(url):
+    return url.startswith('http://') or url.startswith('https://')
+
 def Mp4Info(filename, **args):
     return Bento4Command('mp4info', filename, **args)
 
@@ -60,7 +64,7 @@ def GetTrackIds(mp4):
 
     for track in info['tracks']:
         track_ids.append(track['id'])
-        
+
     return track_ids
 
 def ProcessUrlTemplate(template, representation_id, bandwidth, time, number):
@@ -80,7 +84,7 @@ def ProcessUrlTemplate(template, representation_id, bandwidth, time, number):
     if time is not None:              result = result.replace('$Time$', time)
     result = result.replace('$$', '$')
     return result
-    
+
 class DashSegmentBaseInfo:
     def __init__(self, xml):
         self.initialization = None
@@ -89,21 +93,21 @@ class DashSegmentBaseInfo:
             e = xml.find(DASH_NS+type)
             if e is not None:
                 self.type = type
-                
+
                 # parse common elements
-                
+
                 # type specifics
                 if type == 'SegmentBase' or type == 'SegmentList':
                     init = e.find(DASH_NS+'Initialization')
                     if init is not None:
                         self.initialization = init.get('sourceURL')
-                    
+
                 if type == 'SegmentTemplate':
                     self.initialization = e.get('initialization')
                     self.media          = e.get('media')
                     self.timescale      = e.get('timescale')
                     self.startNumber    = e.get('startNumber')
-                    
+
                 # segment timeline
                 st = e.find(DASH_NS+'SegmentTimeline')
                 if st is not None:
@@ -123,9 +127,9 @@ class DashSegmentBaseInfo:
                         else:
                             item['r'] = 0
                         self.segment_timeline.append(item)
-    
+
                 break
-                   
+
 class DashRepresentation:
     def __init__(self, xml, parent):
         self.xml = xml
@@ -134,23 +138,23 @@ class DashRepresentation:
         self.segment_urls = []
         self.segment_base = DashSegmentBaseInfo(xml)
         self.duration = 0
-        
+
         # parse standard attributes
         self.bandwidth = xml.get('bandwidth')
         self.id        = xml.get('id')
-                    
+
         # compute the segment base type
         node = self
         self.segment_base_type = None
         while node is not None:
             if node.segment_base.type in ['SegmentTemplate', 'SegmentList']:
                 self.segment_base_type = node.segment_base.type
-                break                
-            node = node.parent            
-        
+                break
+            node = node.parent
+
         # compute the init segment URL
         self.ComputeInitSegmentUrl()
-        
+
     def SegmentBaseLookup(self, field):
         node = self
         while node is not None:
@@ -166,29 +170,29 @@ class DashRepresentation:
                 return node.__dict__[field]
             node = node.parent
         return None
-        
+
     def ComputeInitSegmentUrl(self):
         node = self
         while node is not None:
             if node.segment_base.initialization is not None:
                 self.initialization = node.segment_base.initialization
-                break                
+                break
             node = node.parent
-            
+
         self.init_segment_url = ProcessUrlTemplate(self.initialization, representation_id=self.id, bandwidth=self.bandwidth, time=None, number=None)
-                    
+
     def GenerateSegmentUrls(self):
         if self.segment_base_type == 'SegmentTemplate':
             return self.GenerateSegmentUrlsFromTemplate()
         else:
             return self.GenerateSegmentUrlsFromList()
-            
+
     def GenerateSegmentUrlsFromTemplate(self):
         media = self.SegmentBaseLookup('media')
         if media is None:
             print 'WARNING: no media attribute found for representation'
             return
-        
+
         timeline = self.SegmentBaseLookup('segment_timeline')
         if timeline is None:
             start = self.SegmentBaseLookup('startNumber')
@@ -200,7 +204,7 @@ class DashRepresentation:
                 url = ProcessUrlTemplate(media, representation_id=self.id, bandwidth=self.bandwidth, time="0", number=str(current_number))
                 current_number += 1
                 yield url
-                
+
         else:
             current_number = 1
             current_time = 0
@@ -212,14 +216,14 @@ class DashRepresentation:
                     current_number += 1
                     current_time += s['d']
                     yield url
-                        
+
     def GenerateSegmentUrlsFromList(self):
         segs = self.xml.find(DASH_NS+'SegmentList').findall(DASH_NS+'SegmentURL')
         for seg in segs:
             media = seg.get('media')
             if media is not None:
                 yield media
-        
+
     def __str__(self):
         result = "Representation: "
         return result
@@ -232,7 +236,7 @@ class DashAdaptationSet:
         self.representations = []
         for r in self.xml.findall(DASH_NS+'Representation'):
             self.representations.append(DashRepresentation(r, self))
-        
+
     def __str__(self):
         result = 'Adaptation Set:\n' + '\n'.join([str (r) for r in self.representations])
         return result
@@ -241,15 +245,21 @@ class DashPeriod:
     def __init__(self, xml, parent):
         self.xml = xml
         self.parent = parent
+        base_url = self.xml.find(DASH_NS+'BaseURL')
+        if base_url is not None:
+            if IsAbsoluteURL(base_url.text):
+                self.base_urls = [base_url.text]
+            else:
+                self.base_urls = [parent.base_urls[0] + base_url.text]
         self.segment_base = DashSegmentBaseInfo(xml)
         self.adaptation_sets = []
         for s in self.xml.findall(DASH_NS+'AdaptationSet'):
             self.adaptation_sets.append(DashAdaptationSet(s, self))
-        
+
     def __str__(self):
         result = 'Period:\n' + '\n'.join([str(s) for s in self.adaptation_sets])
         return result
-        
+
 class DashMPD:
     def __init__(self, url, xml):
         self.url = url
@@ -258,19 +268,24 @@ class DashMPD:
         self.periods = []
         self.segment_base = DashSegmentBaseInfo(xml)
         self.type = xml.get('type')
-        for p in self.xml.findall(DASH_NS+'Period'):
-            self.periods.append(DashPeriod(p, self))
-        
-        # compute base URL (note: we'll just use the MPD URL for now)
-        self.base_urls = [url] 
+
+        # compute base URL from MPD URL
+        mpd_base = '/'.join(url.split('/')[:-1]) + '/'
+        self.base_urls = [mpd_base]
         base_url = self.xml.find(DASH_NS+'BaseURL')
         if base_url is not None:
-            self.base_urls = [base_url.text]
-        
+            if IsAbsoluteURL(base_url.text):
+                self.base_urls = [base_url.text]
+            else:
+                self.base_urls = [mpd_base + base_url.text]
+
+        for p in self.xml.findall(DASH_NS+'Period'):
+            self.periods.append(DashPeriod(p, self))
+
     def __str__(self):
         result = "MPD:\n" + '\n'.join([str(p) for p in self.periods])
         return result
-        
+
 def ParseMpd(url, xml):
     mpd_tree = ElementTree.XML(xml)
     if mpd_tree.tag.startswith(DASH_NS_COMPAT):
@@ -280,14 +295,14 @@ def ParseMpd(url, xml):
         DASH_NS_URN = DASH_NS_URN_COMPAT
         if Options.verbose:
             print '@@@ Using backward compatible namespace'
-            
+
     mpd = DashMPD(url, mpd_tree)
-    
-    if not (mpd.type is None or mpd.type == 'static'):
-        raise Exception('Only static MPDs are supported')
-        
+
+    #if not (mpd.type is None or mpd.type == 'static'):
+    #    raise Exception('Only static MPDs are supported')
+
     return mpd
-        
+
 def MakeNewDir(dir, is_warning=False):
     if os.path.exists(dir):
         if is_warning:
@@ -304,30 +319,30 @@ def OpenURL(url):
     if url.startswith("file://"):
         return open(url[7:], 'rb')
     else:
-        return urllib2.urlopen(url)
+        req = urllib2.Request(url)
+        req.add_header('x-ad-insertion', 'true')  # Extra header for ComHem
+        return urllib2.urlopen(req)
 
 def ComputeUrl(base_url, url):
     if url.startswith('http://') or url.startswith('https://'):
         raise Exception('Absolute URLs are not supported')
-    
+
     if base_url.startswith('file://'):
         return os.path.join(os.path.dirname(base_url), url)
     else:
         return urlparse.urljoin(base_url, url)
-    
+
 class Cloner:
     def __init__(self, root_dir):
         self.root_dir = root_dir
         self.track_ids = []
         self.init_filename = None
-        
+
     def CloneSegment(self, url, path_out, is_init):
         while path_out.startswith('/'):
             path_out = path_out[1:]
         target_dir = os.path.join(self.root_dir, path_out)
-        if Options.verbose:
-            print 'Cloning', url, 'to', path_out
-    
+
         #os.makedirs(target_dir)
         try:
             os.makedirs(os.path.dirname(target_dir))
@@ -335,10 +350,14 @@ class Cloner:
             if os.path.exists(target_dir):
                 pass
         except:
-            raise            
-                
+            raise
+
         data = OpenURL(url)
         outfile_name = os.path.join(self.root_dir, path_out)
+        if os.path.exists(outfile_name):
+            return False
+        if Options.verbose:
+            print 'Cloning', url, 'to', path_out
         use_temp_file = False
         if Options.encrypt:
             use_temp_file = True
@@ -348,7 +367,7 @@ class Cloner:
         try:
             shutil.copyfileobj(data, outfile)
             outfile.close()
-            
+
             if Options.encrypt:
                 if is_init:
                     self.track_ids = GetTrackIds(outfile_name)
@@ -366,18 +385,19 @@ class Cloner:
 
                 if not is_init:
                     args += ["--fragments-info", self.init_filename]
-                    
+
                 if Options.verbose:
                     print 'mp4encrypt '+(' '.join(args))
                 Bento4Command("mp4encrypt", *args)
         finally:
             if use_temp_file and not is_init:
                 os.unlink(outfile_name)
-    
+        return True
+
     def Cleanup(self):
         if (self.init_filename):
             os.unlink(self.init_filename)
-        
+
 def main():
     # determine the platform binary name
     platform = sys.platform
@@ -391,19 +411,20 @@ def main():
     parser.add_option('', '--quiet', dest="verbose",
                       action='store_false', default=True,
                       help="Be quiet")
-    parser.add_option('', "--encrypt", metavar='<KID:KEY>', 
+    parser.add_option('', "--encrypt", metavar='<KID:KEY>',
                       dest='encrypt', default=None,
-                      help="Encrypt the media, with KID and KEY specified in Hex (32 characters each)")    
+                      help="Encrypt the media, with KID and KEY specified in Hex (32 characters each)")
     parser.add_option('', "--exec-dir", metavar="<exec_dir>",
                       dest="exec_dir", default=os.path.join(SCRIPT_PATH, 'bin', platform),
-                      help="Directory where the Bento4 executables are located")    
-                      
+                      help="Directory where the Bento4 executables are located")
+
     global Options
     (Options, args) = parser.parse_args()
+    print Options
     if len(args) != 2:
         parser.print_help()
         sys.exit(1)
-    
+
     # process arguments
     mpd_url = args[0]
     output_dir = args[1]
@@ -411,55 +432,90 @@ def main():
         if len(Options.encrypt) != 65:
             raise Exception('Invalid argument for --encrypt option')
         Options.kid = Options.encrypt[:32].decode('hex')
-        Options.key = Options.encrypt[33:].decode('hex') 
-        
+        Options.key = Options.encrypt[33:].decode('hex')
+
     # create the output dir
     MakeNewDir(output_dir, True)
-    
-    # load and parse the MPD
+
+    mpd = get_mpd(mpd_url)
+    ElementTree.register_namespace('', DASH_NS_URN)
+    ElementTree.register_namespace('mas', MARLIN_MAS_NS_URN)
+
+    if mpd.type == 'dynamic':
+        # Start looping
+        start_time = time.time()
+        last_time = start_time
+        for i in range(1800):
+            print "### Iteration %d" % i
+            clone_asset(mpd_url, output_dir, i)
+            this_time = time.time()
+            if this_time - last_time < 2:
+                time.sleep(2 - (this_time - last_time))
+            last_time = this_time
+
+    else:
+        clone_asset(mpd_url, output_dir)
+
+def get_mpd(mpd_url):
+    "Load and parse the MPD"
     if Options.verbose: print "Loading MPD from", mpd_url
     try:
         mpd_xml = OpenURL(mpd_url).read()
     except Exception as e:
         print "ERROR: failed to load MPD:", e
         sys.exit(1)
-        
+
     if Options.verbose: print "Parsing MPD"
     mpd_xml = mpd_xml.replace('nitialisation', 'nitialization')
     mpd = ParseMpd(mpd_url, mpd_xml)
-        
-    ElementTree.register_namespace('', DASH_NS_URN)
-    ElementTree.register_namespace('mas', MARLIN_MAS_NS_URN)
+    return mpd
+
+def clone_asset(mpd_url, output_dir, clone_iteration=-1):
+    "Clone to output_dir using Options"
+
+    mpd = get_mpd(mpd_url)
 
     cloner = Cloner(output_dir)
     for period in mpd.periods:
         for adaptation_set in period.adaptation_sets:
             for representation in adaptation_set.representations:
+                bandwidth = int(representation.bandwidth)
+                if bandwidth > 1000000:
+                    print "Skipping %s" % representation.id
+                    continue
                 # compute the base URL
                 base_url = representation.AttributeLookup('base_urls')[0]
                 if Options.verbose:
                     print 'Base URL = '+base_url
-                    
+
                 # process the init segment
                 if Options.verbose:
                     print '### Processing Initialization Segment'
                 url = ComputeUrl(base_url, representation.init_segment_url)
-                cloner.CloneSegment(url, representation.init_segment_url, True)
+                cloner.CloneSegment(url, representation.init_segment_url,
+                                     True)
 
-                # process all segment URLs                
+                # process all segment URLs
                 if Options.verbose:
                     print '### Processing Media Segments for AdaptationSet', representation.id
+                nr_segments_cloned = 0
+                nr_segments = 0
                 for seg_url in representation.GenerateSegmentUrls():
                     url = ComputeUrl(base_url, seg_url)
                     try:
-                        cloner.CloneSegment(url, seg_url, False)
+                        did_clone = cloner.CloneSegment(url, seg_url, False)
+                        if did_clone:
+                            nr_segments_cloned += 1
+                        nr_segments += 1
                     except (urllib2.HTTPError, urllib2.URLError, IOError):
                         # move to the next representation
                         break
-                
-                # cleanup the init segment    
+
+                # cleanup the init segment
                 cloner.Cleanup()
-                
+                print("Cloned %d of %d segment for %s" % (nr_segments_cloned,
+                                                          nr_segments,
+                                                          representation.id))
     # modify the MPD if needed
     if Options.encrypt:
         for p in mpd.xml.findall(DASH_NS+'Period'):
@@ -470,13 +526,17 @@ def main():
                 cid = ElementTree.SubElement(cids, MARLIN_MAS_NS+'MarlinContentId')
                 cid.text = 'urn:marlin:kid:'+Options.kid.encode('hex')
                 s.insert(0, cp)
-                
-    # write the MPD    
+
+    # write the MPD
+    output_name = os.path.join(output_dir,
+                               os.path.basename(urlparse.urlparse(
+                                   mpd_url).path))
+    if clone_iteration >= 0:
+        output_name += "_%04d" % clone_iteration
     xml_tree = ElementTree.ElementTree(mpd.xml)
-    xml_tree.write(os.path.join(output_dir, os.path.basename(urlparse.urlparse(mpd_url).path)), encoding="UTF-8", xml_declaration=True)
-    
-###########################    
+    xml_tree.write(output_name, encoding="UTF-8", xml_declaration=True)
+
+###########################
 SCRIPT_PATH = os.path.abspath(os.path.dirname(__file__))
 if __name__ == '__main__':
     main()
-    
